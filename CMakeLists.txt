@@ -5,7 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_executable(wdeps wdeps.cpp pe-parse/parse.cpp pe-parse/buffer.cpp)
 
+set(Boost_USE_STATIC_LIBS on)
 find_package(Boost 1.60 COMPONENTS program_options filesystem REQUIRED )
 
 target_include_directories(wdeps PRIVATE ${Boost_INCLUDE_DIR})
-target_link_libraries(wdeps ${Boost_LIBRARIES})
+target_link_libraries(wdeps ${Boost_LIBRARIES} -static)
