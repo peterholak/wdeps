@@ -12,6 +12,8 @@ Example output:
     
 Command-line options:
 
+    Usage: wdeps [options] <input>
+    
     Options:
       --copy dir            If specified, copy all dependencies to the specified
                             directory.

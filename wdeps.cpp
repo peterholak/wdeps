@@ -322,6 +322,7 @@ int main(int argc, char** argv) {
     }
 
     if (varMap.count("help") || varMap.count("input") == 0) {
+        cout << "Usage: wdeps [options] <input>\n" << endl;
         cout << description << endl;
         return 0;
     }
