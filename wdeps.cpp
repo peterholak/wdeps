@@ -9,18 +9,13 @@
 #include <functional>
 #include <iomanip>
 #include <boost/program_options.hpp>
+// Using boost::filesystem here, because the gcc distribution from msys2 currently doesn't have std::filesystem
 #include <boost/filesystem.hpp>
 
 using namespace peparse;
 using namespace std;
 namespace po = boost::program_options;
 namespace fs = boost::filesystem;
-
-int getImports(void *N, VA impAddr, string &modName, string &symName) {
-    auto modules = reinterpret_cast<set<string>*>(N);
-    modules->insert(modName);
-    return 0;
-}
 
 vector<string> split(const string& s, char delimiter) {
     vector<string> result;
@@ -37,7 +32,7 @@ vector<string> split(const string& s, char delimiter) {
     return result;
 }
 
-vector<string> getPath() {
+vector<string> getPathEnv() {
     // TODO: portable shit, make configurable for cross-system use
     string path = getenv("PATH");
     auto parts = split(path, ';');
@@ -49,39 +44,6 @@ vector<string> getPath() {
     return parts;
 }
 
-size_t getLastSeparator(const std::string& file) {
-    auto lastSlash = file.find_last_of('/');
-    auto lastBackslash = file.find_last_of('\\');
-
-    if (lastSlash == string::npos && lastBackslash == string::npos) {
-        return string::npos;
-    }
-
-    auto last = (
-        lastSlash == string::npos ?
-        lastBackslash :
-        (lastBackslash == string::npos ? lastSlash : max(lastSlash, lastBackslash))
-    );
-
-    if (last == file.length() - 1) {
-        return string::npos;
-    }
-
-    return last;
-}
-
-string getFileDirectory(const string& file) {
-    auto last = getLastSeparator(file);
-    if (last == string::npos) { return "."; }
-    return file.substr(0, last);
-}
-
-string getFileName(const std::string& file) {
-    auto last = getLastSeparator(file);
-    if (last == string::npos) { return file; }
-    return file.substr(last + 1);
-}
-
 string getFileNameWithCorrectCase(const std::string& existingFile) {
     // TODO: portable shit, also this is a hacky but quick way to get the file name with the correct case
     char shortBuffer[MAX_PATH];
@@ -89,21 +51,17 @@ string getFileNameWithCorrectCase(const std::string& existingFile) {
     // TODO: also check for failures
     GetShortPathNameA(existingFile.c_str(), shortBuffer, MAX_PATH);
     GetLongPathNameA(shortBuffer, longBuffer, MAX_PATH);
-    return getFileName(longBuffer);
+    return fs::path(longBuffer).filename().string();
 }
 
-bool directoryContains(const string& directory, const string& file) {
-    return fs::exists(directory + "/" + file);
-}
-
-string systemDirectory() {
+fs::path systemDirectory() {
     // TODO: portable shit
     char buffer[MAX_PATH];
     GetSystemDirectoryA(buffer, MAX_PATH);
     return string(buffer);
 }
 
-string windowsDirectory() {
+fs::path windowsDirectory() {
     // TODO: portable shit
     char buffer[MAX_PATH];
     GetWindowsDirectoryA(buffer, MAX_PATH);
@@ -111,31 +69,31 @@ string windowsDirectory() {
 }
 
 struct DllPath {
-    string path;
+    fs::path path;
     enum { User, System, Missing } location;
 
     DllPath& fix() {
-        path = getFileDirectory(path) + "/" + getFileNameWithCorrectCase(path);
+        path = path.parent_path() / getFileNameWithCorrectCase(path.string());
         return *this;
     }
 };
 
-DllPath getDllPath(const string& appDirectory, const string& dllName) {
-    if (directoryContains(appDirectory, dllName)) {
-        return DllPath{ appDirectory + "/" + dllName, DllPath::User }.fix();
+DllPath getDllPath(const fs::path& appDirectory, const string& dllName) {
+    if (fs::exists(appDirectory / dllName)) {
+        return DllPath{ appDirectory / dllName, DllPath::User }.fix();
     }
 
-    if (directoryContains(systemDirectory(), dllName)) {
-        return DllPath{ systemDirectory() + "/" + dllName, DllPath::System }.fix();
+    if (fs::exists(systemDirectory() / dllName)) {
+        return DllPath{ systemDirectory() / dllName, DllPath::System }.fix();
     }
 
-    if (directoryContains(windowsDirectory(), dllName)) {
-        return DllPath{ windowsDirectory() + "/" + dllName, DllPath::System }.fix();
+    if (fs::exists(windowsDirectory() / dllName)) {
+        return DllPath{ windowsDirectory() / dllName, DllPath::System }.fix();
     }
 
-    for (auto& s : getPath()) {
-        if (directoryContains(s, dllName)) {
-            return DllPath{ s + "/" + dllName, DllPath::User }.fix();
+    for (auto& s : getPathEnv()) {
+        if (fs::exists(fs::path(s) / dllName)) {
+            return DllPath{ fs::path(s) / dllName, DllPath::User }.fix();
         }
     }
 
@@ -151,19 +109,25 @@ struct Dll {
     bool stripped = false;
     vector<Dll*> dependencies;
 
+    bool isSystem() const { return path.location == DllPath::System; }
+
     void fillDependencies(map<string, unique_ptr<Dll>>& globalMap, bool recurseIntoSystem = false) {
         if (path.location == DllPath::Missing || (path.location == DllPath::System && !recurseIntoSystem)) {
             return;
         }
-        auto directory = getFileDirectory(path.path);
-        auto parsed = ParsePEFromFile(path.path.c_str());
+        auto directory = path.path.parent_path();
+        auto parsed = ParsePEFromFile(path.path.string().c_str());
         if (parsed == nullptr) {
             isValid = false;
             return;
         }
 
         set<string> modules;
-        IterImpVAString(parsed, getImports, &modules);
+        IterImpVAString(parsed, [](void *N, VA impAddr, string &modName, string &symName) {
+            auto modulesPtr = reinterpret_cast<set<string>*>(N);
+            modulesPtr->insert(modName);
+            return 0;
+        }, &modules);
         auto& c = parsed->peHeader.nt.FileHeader.Characteristics;
         if ((c & IMAGE_FILE_DEBUG_STRIPPED) && (c & IMAGE_FILE_LINE_NUMS_STRIPPED) && (c & IMAGE_FILE_LOCAL_SYMS_STRIPPED)) {
             stripped = true;
@@ -180,11 +144,11 @@ struct Dll {
         }
     }
 
-    string toString() const {
+    string toString(bool showPath = true) const {
         switch (path.location) {
-            case DllPath::Missing: return path.path + " (MISSING)";
-            case DllPath::User: return getFileName(path.path) + (isValid ? "" : " (INVALID!)") + " (" + path.path + ")";
-            case DllPath::System: return getFileName(path.path) + "(SYSTEM) (" + path.path + ")";
+            case DllPath::Missing: return path.path.string() + " (MISSING)";
+            case DllPath::User: return path.path.filename().string() + (isValid ? "" : " (INVALID!)") + (showPath ? " (" + path.path.string() + ")" : "");
+            case DllPath::System: return path.path.filename().string() + "(SYSTEM)" + (showPath ? " (" + path.path.string() + ")" : "");
         }
     }
 };
@@ -223,13 +187,14 @@ void walkDependencies(
 void dumpDependenciesTree(
     const Dll& dll,
     bool visitRoot = true,
+    bool showPath = true,
     const function<bool(const Dll&, bool wasDumped, uint level)>& printFilter = {},
     const function<bool(const Dll&, bool wasDumped, uint level)>& recurseFilter = {}
 ) {
     walkDependencies(dll, [&](const Dll& dependency, bool wasVisited, uint level) {
         string indent(level * 4, ' ');
         if (!printFilter || printFilter(dependency, wasVisited, level)) {
-            cout << indent << dependency.toString() << (wasVisited ? " (+ more, see above)" : "") << endl;
+            cout << indent << dependency.toString(showPath) << (wasVisited ? " (+)" : "") << endl;
         }
     }, visitRoot, recurseFilter);
 }
@@ -272,11 +237,11 @@ string formatFileSize(size_t size) {
     return ss.str();
 }
 
-void printSizeInfo(const Dll& dll) {
+void printSizeInfo(const Dll& dll, bool includeSystem = false, bool showPath = false) {
     size_t total = 0;
     bool anyUnstripped = false;
     walkDependencies(dll, [&](const Dll& dependency, bool wasVisited, uint level) {
-        if (dependency.path.location == DllPath::System || wasVisited) { return; }
+        if ((dependency.isSystem() && !includeSystem) || wasVisited) { return; }
 
         optional<size_t> fileSize;
         boost::system::error_code fileError;
@@ -291,8 +256,14 @@ void printSizeInfo(const Dll& dll) {
         string indent = (level > 0 ? "    " : "");
         string size = fileSize ? formatFileSize(*fileSize) : "ERROR";
         if (!dependency.stripped) { anyUnstripped = true; }
-        cout << indent << getFileName(dependency.path.path) << " (" << size << ")" <<
-                (dependency.stripped ? "" : "*") << endl;
+        cout <<
+            indent <<
+            dependency.path.path.filename().string() <<
+            " (" << size << ")" <<
+            (dependency.isSystem() ? " (SYSTEM)" : "") <<
+            ((dependency.stripped || dependency.isSystem()) ? "" : "*") <<
+            (showPath ? " (" + dependency.path.path.string() + ")" : "") <<
+            endl;
     }, true);
     cout << endl;
     cout << "Total: " << formatFileSize(total) << endl;
@@ -301,9 +272,9 @@ void printSizeInfo(const Dll& dll) {
     }
 }
 
-void copyTo(const Dll& dll, const string& target, bool overwrite = false, bool includeRoot = false) {
+void copyTo(const Dll& dll, const fs::path& target, bool overwrite = false, bool includeRoot = false) {
     try {
-        if (target != "." && target != "..") {
+        if (!target.filename_is_dot() && !target.filename_is_dot_dot()) {
             fs::create_directories(target);
         }
     }catch(exception& e) {
@@ -318,7 +289,7 @@ void copyTo(const Dll& dll, const string& target, bool overwrite = false, bool i
             }
             fs::copy_file(
                 dependency.path.path,
-                target + "/" + getFileName(dependency.path.path),
+                target / dependency.path.path.filename(),
                 overwrite ? fs::copy_option::overwrite_if_exists : fs::copy_option::none
             );
         }catch(exception& e) {
@@ -333,8 +304,11 @@ int main(int argc, char** argv) {
         ("copy", po::value<string>()->value_name("dir"), "If specified, copy all dependencies to the specified directory.")
         ("force", po::bool_switch(), "When used with --copy, overwrite existing files.")
         ("all", po::bool_switch(), "When used with --copy, also include the input file.")
-        ("help", "Prints this help message")
-        ("input", po::value<vector<string>>()->value_name("file"), "The exe/dll file for which to show dependencies");
+        ("tree", po::bool_switch(), "Display the dependencies as a tree (each dependency will only be expanded once).")
+        ("system", po::bool_switch(), "Include system dependencies, doesn't affect `--copy`, system dependencies are not recursed into.")
+        ("path", po::bool_switch(), "Include the full path to the dependencies in the list.")
+        ("help", "Print this help message.")
+        ("input", po::value<vector<string>>()->value_name("file"), "The exe/dll file for which to show dependencies.");
     po::positional_options_description pos;
     pos.add("input", 1);
 
@@ -352,10 +326,19 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    bool includeSystem = varMap["system"].as<bool>();
+    bool showPath = varMap["path"].as<bool>();
+
     map<string, unique_ptr<Dll>> globalMap;
     Dll exe({ varMap["input"].as<vector<string>>().at(0), DllPath::User });
     exe.fillDependencies(globalMap);
-    printSizeInfo(exe);
+    if (varMap["tree"].as<bool>()) {
+        dumpDependenciesTree(exe, true, showPath, [includeSystem](const Dll& dep, bool wasDumped, uint level) {
+            return includeSystem || !dep.isSystem();
+        });
+    }else{
+        printSizeInfo(exe, includeSystem, showPath);
+    }
 
     if (varMap.count("copy")) {
         copyTo(exe, varMap["copy"].as<string>(), varMap["force"].as<bool>(), varMap["all"].as<bool>());
